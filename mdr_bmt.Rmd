@@ -1,0 +1,1049 @@
+---
+title: "Final MDR-BMT"
+author: "Henderson, Heather"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+packages <- function(x){
+  for(i in x){
+     if(!require(i, character.only = TRUE)){
+      install.packages(i, dependencies = TRUE)
+       library(i, character.only = TRUE)
+    }
+  }
+}
+packages(c("haven", "readxl", "tidyverse" , "data.table" , "naniar", "rockchalk", "lubridate", "kableExtra", "DT", "formatR", "zoo", "binom", "plotly", "janitor", "sjlabelled", "Hmisc", "rms", "aod", "sandwich", "lmtest", "tableone", "broom", "investr", "survival", "survminer"))
+```
+
+# Import data
+
+```{r message=FALSE, warning=FALSE}
+setwd("Z:/Van Duin_David_IRB23-2326/amr_mapping_rproj/")
+
+pre_epic_data <- readRDS("enterobact_data_pre_epic_locations.rds") # Processed pre-Epic data with demographics and locations
+epic_data <- readRDS("data files/entero_isolates_2014_2023_april2024.rds")
+matched_mrns <- read_excel("Z:/Andermann_Tessa_IRB22-2011/Andermann_IRB22_2011_MATCHED_MRNS_WITH_DATASETNAME.xlsx") # List of MRNs and pat_deids from Loretta
+bmtnew_2023 <- read_excel("C:/Users/henderh/Desktop/2023_03_bmtnew_wzipcode.xlsx")
+zip_ses <- read_excel("J:/ID/AMR_map_van_Duin/zip_ses.xlsx")
+depts_pre_epic <- read_excel("C:/Users/henderh/OneDrive - University of North Carolina at Chapel Hill/Projects/Andermann/MDR_BMT/depts_pre_epicv2.xlsx")
+depts_epic <- read_excel("C:/Users/henderh/OneDrive - University of North Carolina at Chapel Hill/Projects/Andermann/MDR_BMT/depts_epicv2.xlsx")
+```
+
+Subset original analysis dataset to pre-Epic data, join dataset with patient locations, export RDS file
+This is dataset read in above as pre_epic_data
+
+```{r message=FALSE, warning=FALSE}
+# culture_data_clean_2000_2021 <- readRDS("Z:/VanDuin_David_IRB18-3438/culture_data_clean_2000_2021.rds") # Original dataset used for analysis, contains MRNs, no locations - use to get pre-Epic data with demographics
+# pre_epic_data <- readRDS("Z:/VanDuin_David_IRB18-3438/enterobact_data_2000_2013_locations.rds") # Pre-Epic data with locations, no demographics
+
+# pre_epic <- culture_data_clean_2000_2021 %>%
+#   distinct() %>%
+#   filter(year(culture_date) < 2014) %>%
+#   inner_join(pre_epic_data %>% rename(pat_mrn_id = mrn), relationship = "many-to-many") %>%
+#   select(pat_mrn_id, isolate_id, dob, gender, race_recode, ethnicity, culture_date, specimen_source_recode, organism_name, genus, antibiotic, class, nonsusceptible, resistant_to_class, mdr, zip_code, dept, name, description, dept_type) %>%
+#   rename(birth_date = dob,
+#          isolate_source = specimen_source_recode,
+#          antibiotic_class = class,
+#          department_name = dept,
+#          facility_name = name)
+# 
+# n_distinct(pre_epic$pat_mrn_id)
+# 33,155 patients
+# write_rds(pre_epic, "enterobact_data_pre_epic_locations.rds")
+```
+
+BMT pat_deid from TraCS
+
+```{r message=FALSE, warning=FALSE}
+# Get MRNs and pat_deids for BMT patients with isolates
+bmt_mrns <- matched_mrns %>%
+  clean_names() %>%
+  mutate_all(tolower) %>%
+  filter(dataset == "bmt") %>%
+  select(-c(dataset, merged_mrn, current_mrn)) %>%
+  rename(pat_deid = matches_cuture_data)
+```
+
+## Clean BMT data
+
+```{r message=FALSE, warning=FALSE}
+bmt_data <- bmtnew_2023 %>% 
+  clean_names() %>%
+  mutate(pat_mrn_id = str_pad(mrn, 12, "left", "0")) %>% # Add leading zeros to MRN
+  mutate_all(tolower) %>% # Convert all character values to lower case
+  mutate(race = case_when(str_detect(ethnicity, "cauc") ~ "white",
+                                 str_detect(ethnicity, "black/aa") ~ "black",
+                                 is.na(ethnicity) ~ "unknown",
+                                 TRUE ~ "other"),
+         dxdate = as.Date(dxdate),
+         agvhonst = as.Date("1899-12-30") + as.numeric(agvhonst), # Correct dates according to Excel origin date
+         agmxgrdt = as.Date("1899-12-30") + as.numeric(agmxgrdt),
+         cgvhonst = as.Date("1899-12-30") + as.numeric(cgvhonst),
+         cgmxgrdt = as.Date("1899-12-30") + as.numeric(cgmxgrdt)) %>%
+  select_if(~ !all(is.na(.))) %>% # Remove columns that contain no data
+  filter(!is.na(pat_mrn_id)) %>%
+  # Remove variables not used in analysis
+  select(-c(urid, name, mrn, dob, gender, ethnicity, hisp, age, age_at_tx, admit_date, co_morbidity, zipcode, specific, tx_number, uncfumd, a_vs_p, discharge_date, plat_20_no_tx_w_in_7_days, days_til_pl, kps_tx, earliest_engraftment_date, days_til_engraft, los, cod, tx_days, dis_st_pre_tx, cond_drugs, classification, status))
+
+# Correct diagnosis dates that are wrong
+bmt_data$dxdate[bmt_data$pat_mrn_id == "000014647572"] <- as.Date("2014-02-04")
+bmt_data$dxdate[bmt_data$pat_mrn_id == "000020136933"] <- as.Date("2011-10-20")
+bmt_data$dxdate[bmt_data$pat_mrn_id == "000040011975"] <- as.Date("2006-01-05")
+# 3284 MRNs
+```
+
+Merge file with pat deids for BMT patients with isolates
+Need pat deid for merging with Epic data
+
+```{r message=FALSE, warning=FALSE}
+bmt_data1 <- bmt_data %>%
+  left_join(bmt_mrns %>% select(pat_mrn_id, pat_deid)) %>%
+  relocate(pat_mrn_id, .before = broad_code) %>%
+  relocate(pat_deid, .after = pat_mrn_id) %>%
+  relocate(race, .after = pat_deid)
+```
+
+## Merge pre-Epic and BMT datasets
+
+```{r message=FALSE, warning=FALSE}
+# Get all departments with BMT patients
+# depts_pre_epic <- pre_epic_data %>%
+#   inner_join(bmt_data1, relationship = "many-to-many") %>%
+#   filter(culture_date > infusion_date) %>%
+#   select(department_name, description, dept_type) %>%
+#   distinct()
+```
+
+```{r}
+pre_epic_bmt <- pre_epic_data %>%
+  left_join(bmt_data1 %>% mutate(bmt = TRUE), relationship = "many-to-many", by = "pat_mrn_id") %>% 
+  left_join(depts_pre_epic) %>%
+  filter(!is.na(nonsusceptible),
+         !is.na(location_type)) %>%
+  mutate(bmt = ifelse(culture_date < infusion_date | is.na(infusion_date), FALSE, TRUE),
+         race_recode = coalesce(race, race_recode),
+         # Make sure race value is retained from BMT dataset
+         race_recode = ifelse(!race_recode %in% c("white", "black"), "other/unknown", race_recode),
+         ethnicity_recode = case_when(ethnicity %in% c("patient refused", "unknown", NA) ~ "unknown",
+                                      ethnicity == "hispanic or latino" ~ "hispanic",
+                                      ethnicity == "not hispanic or latino" ~ "nonhispanic")) %>% 
+  relocate(ethnicity_recode, .after = race_recode) %>%
+  select(-c(facility_name, description, dept_type, race, ethnicity))
+```
+
+```{r}
+pre_epic_bmt %>% 
+  select(isolate_id, bmt, mdr) %>%
+  distinct() %>%
+  tabyl(bmt, mdr) %>%
+  adorn_totals(c("row", "col")) %>%
+  adorn_percentages() %>%
+  adorn_pct_formatting() %>%
+  adorn_ns() %>%
+  adorn_title() %>%
+  kable("html") %>%
+  kable_styling()
+```
+
+## Merge Epic and BMT datasets
+
+```{r message=FALSE, warning=FALSE}
+epic_bmt <- epic_data %>%
+  filter(!is.na(nonsusceptible)) %>%
+  select(pat_deid, isolate_id, birth_date, gender, race_recode, ethnicity_recode, department_name, order_date, isolate_source, organism_name, genus, antibiotic, antibiotic_class, nonsusceptible, resistant_to_class, mdr, zip_code) %>% 
+  distinct() %>%
+  rename(culture_date = order_date)
+
+epic_bmt1 <- epic_bmt %>%
+  left_join(bmt_data1 %>% mutate(bmt = TRUE), relationship = "many-to-many", by = "pat_deid") %>% 
+  mutate(bmt = ifelse(culture_date < infusion_date | is.na(infusion_date), FALSE, TRUE),
+         race_recode = coalesce(race, race_recode)) %>% # Make sure race value is retained from BMT dataset
+  select(-race)
+```
+
+```{r}
+# List of department names where BMT patient cultures were ordered
+# depts_epic1 <- epic_bmt1 %>%
+#   filter(bmt) %>%
+#   select(department_name) %>%
+#   distinct()
+
+epic_bmt2 <- epic_bmt1 %>%
+  left_join(depts_epic) %>%
+  filter(!is.na(location_type))
+```
+
+```{r}
+epic_bmt2 %>% 
+  select(isolate_id, bmt, mdr) %>%
+  distinct() %>%
+  tabyl(bmt, mdr) %>%
+  adorn_totals(c("row", "col")) %>%
+  adorn_percentages() %>%
+  adorn_pct_formatting() %>%
+  adorn_ns() %>%
+  adorn_title() %>%
+  kable("html") %>%
+  kable_styling()
+```
+
+# Combine Epic and pre-Epic datasets
+Add zip code / SES data
+
+```{r message=FALSE, warning=FALSE}
+bmt_all <- pre_epic_bmt %>%
+  bind_rows(epic_bmt2) %>%
+  distinct() %>%
+  left_join(zip_ses %>% select(zip_code, pctile) %>% mutate(zip_code = as.character(zip_code))) %>%
+  mutate(age = floor(as.numeric((culture_date - birth_date) / 365.25)),
+         death_date = as.Date(date_of_death),
+         age50 = ifelse(age >= 50, TRUE, FALSE),
+         culture_year = year(culture_date),
+         race_recode = factor(race_recode, levels = c("white", "black", "other/unknown")),
+         ethnicity_recode = factor(ethnicity_recode, levels = c("hispanic", "nonhispanic", "unknown")),
+         sesqtile = ntile(pctile, 4), # Create quartiles for SES
+         sesqtile = factor(sesqtile)) # Convert to factor for correct ordering
+```
+
+Recode class for anti-pseudomonal cephalosporins
+Update resistance to class and MDR variables
+
+```{r message=FALSE, warning=FALSE}
+bmt_all1 <- bmt_all %>%
+  mutate(class_recode = ifelse(antibiotic %in% c("ceftazidime", "cefepime"), "antipseudomonal_cephalosporin", antibiotic_class), 
+         class_recode = ifelse(antibiotic %in% c("cefiderocol", "cefixime", "cefotaxime", "cefpodoxime", "cefpodoxime proxetil", "ceftaroline", "ceftizoxime","ceftriaxone"), "cephalosporin_3rd_gen", class_recode),
+         class_recode_f = ifelse(class_recode %in% c("aminoglycoside", "carbapenem", "cephalosporin_2nd_gen", "cephalosporin_3rd_gen", "antipseudomonal_cephalosporin", "penicillins", "penicillins_bli", "quinolone", "sulfonamide"), class_recode, "other"),
+         # Define order and labels for classes of interest
+         class_recode_f = factor(class_recode_f, levels = c("aminoglycoside", "carbapenem", "cephalosporin_2nd_gen", "cephalosporin_3rd_gen", "antipseudomonal_cephalosporin", "penicillins", "penicillins_bli", "quinolone", "sulfonamide", "other"), labels = c("Aminoglycosides", "Carbapenems", "Cephalosporins, 2nd generation", "Cephalosporins, 3rd generation", "Cephalosporins, Anti-Pseudomonal", "Penicillins", "Penicillin/Beta-lactamase inhibitors", "Quinolones", "Sulfonamides", "Other"))) %>%
+  select(-antibiotic_class)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Correct resistant_to_class designation for reclassified drugs using value from nonsusceptible variable
+antipseud_ceph_recode <- bmt_all1 %>%
+  mutate(resistant_to_class = ifelse(class_recode == "antipseudomonal_cephalosporin", nonsusceptible, resistant_to_class)) %>%
+  filter(class_recode == "antipseudomonal_cephalosporin") %>%
+  select(isolate_id, culture_year, antibiotic, nonsusceptible, resistant_to_class) %>%
+  distinct() %>%
+  add_count(isolate_id) %>%
+  add_count(isolate_id, nonsusceptible) %>%
+  mutate(resistant_new = ifelse(n != nn, TRUE, resistant_to_class)) %>%
+  select(isolate_id, resistant_new, resistant_to_class) %>%
+  distinct()
+
+# Recode MDR to incorporate changes in antibiotic classes
+mdr_recode <- bmt_all1 %>%
+  select(isolate_id, class_recode_f, resistant_to_class, mdr) %>%
+  distinct() %>%
+  filter(resistant_to_class) %>%
+  add_count(isolate_id) %>%
+  mutate(mdr_new = ifelse(n >= 3, TRUE, FALSE)) %>%
+  select(isolate_id,, mdr_new) %>%
+  distinct()
+```
+
+```{r}
+bmt_all2 <- bmt_all1 %>%
+  left_join(mdr_recode) %>%
+  left_join(antipseud_ceph_recode) %>%
+  mutate(pat_id = ifelse(!is.na(pat_mrn_id), pat_mrn_id, pat_deid),
+         mdr_new = ifelse(is.na(mdr_new), FALSE, mdr_new),
+         resistant_to_class = ifelse(!is.na(resistant_new), resistant_new, resistant_to_class),
+         gender = ifelse(!gender %in% c("male", "female"), "unknown", gender),
+         isolate_source_factor = factor(isolate_source, levels = c("urine", "blood", "resp", "other")),
+         location_type = ifelse(location_type %in% c("other", "unknown"), "other/unknown", location_type),
+         location_type = factor(location_type, levels = c("outpatient", "inpatient", "icu", "emergency", "other/unknown"))) %>%
+  select(-c(mdr, resistant_new, pat_mrn_id, pat_deid))
+```
+
+23 patients classified as both BMT and non-BMT after concatenating datasets
+Remove observation with non-BMT classification
+
+```{r}
+dups <- bmt_all2 %>%
+  select(pat_id, bmt) %>%
+  distinct() %>%
+  add_count(pat_id) %>%
+  filter(n > 1, !bmt) %>%
+  select(-n)
+
+bmt_all3 <- bmt_all2 %>%
+  anti_join(dups)
+rm(dups)
+# write_rds(bmt_all3, "Z:/Andermann_Tessa_IRB22-2011/enterobacterales_bmt_data_final.rds")
+```
+
+# Frequencies
+
+```{r message=FALSE, warning=FALSE}
+bmt_all3 %>% 
+  select(isolate_id, mdr_new, bmt) %>%
+  distinct() %>%
+  tabyl(bmt, mdr_new) %>%
+  adorn_totals(c("row", "col")) %>%
+  adorn_percentages() %>%
+  adorn_pct_formatting() %>%
+  adorn_ns() %>%
+  adorn_title() %>%
+  kable("html") %>%
+  kable_styling()
+```
+
+```{r message=FALSE, warning=FALSE}
+table1vars_bmt <- bmt_all3 %>% 
+  filter(bmt) %>% # Select only BMT patients
+  group_by(pat_id) %>%
+  slice(which.min(culture_date)) %>% # Select earliest culture date for each patient - if more than 1 on same date will select 1st observation
+  ungroup %>%
+  select(pat_id, broad_code, allo_auto, myelo, agvhonst, agvhovgr, agvhmxgr, agmxgrdt, cgvhonst, cgvhmxgr, cgvhdsev, cgmxgrdt) %>%   
+  distinct() 
+
+vars <- c("broad_code", "allo_auto", "myelo", "agvhovgr", "agvhmxgr")
+factorVars <- c("broad_code", "allo_auto", "myelo", "agvhovgr", "agvhmxgr")
+tableOne <- CreateTableOne(vars = vars, data = table1vars_bmt, factorVars = factorVars)
+tbl <- (print(tableOne, nonnormal = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE, test = TRUE, testExact = fisher.test, showAllLevels = TRUE))
+
+tbl %>% 
+  kable("html") %>%
+  kable_styling()
+```
+
+```{r message=FALSE, warning=FALSE}
+table1vars_bmt %>%
+  tabyl(allo_auto, myelo) %>%
+  adorn_totals(c("row", "col")) %>% 
+  adorn_percentages("col") %>% 
+  adorn_pct_formatting() %>% 
+  adorn_ns() %>%
+  adorn_title() %>%
+  kable("html") %>%
+  kable_styling()
+
+table1vars_bmt %>%
+  tabyl(allo_auto, agvhovgr) %>%
+  adorn_totals(c("row", "col")) %>% 
+  adorn_percentages("col") %>% 
+  adorn_pct_formatting() %>% 
+  adorn_ns() %>%
+  adorn_title() %>%
+  kable("html") %>%
+  kable_styling()
+
+table1vars_bmt %>%
+  tabyl(agvhmxgr, agvhovgr) %>%
+  adorn_totals(c("row", "col")) %>% 
+  adorn_percentages("col") %>% 
+  adorn_pct_formatting() %>% 
+  adorn_ns() %>%
+  adorn_title() %>%
+  kable("html") %>%
+  kable_styling()
+```
+
+# Analysis
+## Figure 1: Unadjusted proportions resistant by group
+
+```{r message=FALSE, warning=FALSE}
+# Calculate percent MDR and add columns needed to combine with antibiotic class resistance data below
+overall_mdr <- bmt_all3 %>% 
+  select(isolate_id, mdr_new, bmt) %>%
+  distinct() %>% 
+  group_by(mdr_new, bmt) %>% 
+  summarise(resistant = n()) %>% 
+  group_by(bmt) %>%
+  mutate(tot_group = sum(resistant),
+         pct_nonsusc = round(resistant / tot_group * 100, 1), 
+         class_recode_f = "Multidrug-resistant", 
+         resistant_to_class = TRUE) %>%
+  filter(mdr_new) %>%
+  ungroup()
+```
+
+```{r message=FALSE, warning=FALSE}
+class_names <- c("Aminoglycosides", "Carbapenems", "Cephalosporins, Anti-Pseudomonal", "Cephalosporins, 2nd generation", "Cephalosporins, 3rd generation", "Penicillins", "Penicillin/Beta-lactamase inhibitors", "Quinolones", "Sulfonamides") # List of classes to be used in analysis
+
+# Figure 1 cont'd, calculate percent resistant by group
+class_prop_ci <- bmt_all3 %>% 
+  filter(class_recode_f %in% class_names) %>%
+  select(pat_id, class_recode_f, resistant_to_class, bmt) %>%
+  distinct() %>%
+  group_by(class_recode_f, resistant_to_class, bmt) %>%
+  summarise(resistant = n()) %>%
+  group_by(class_recode_f, bmt) %>%
+  mutate(tot_group = sum(resistant),
+         pct_nonsusc = round(resistant / tot_group * 100, 1)) %>% 
+  ungroup() %>%
+  filter(resistant_to_class) %>%
+  rbind(overall_mdr %>% select(-mdr_new)) # Append MDR dataframe from above so MDR appears in list of classes
+
+confints_fig1 <- binom.confint(x = class_prop_ci$resistant, n = class_prop_ci$tot_group, methods = "wilson") # Estimate confidence intervals and add to dataframe
+class_prop_ci$lower <- round(confints_fig1$lower * 100, 1)
+class_prop_ci$upper <- round(confints_fig1$upper * 100, 1)
+
+rm(confints_fig1)
+```
+
+### Resistance proportions with confidence intervals
+
+```{r message=FALSE, warning=FALSE}
+# Get proportions for antibiotic classes
+prop_class <- bmt_all3 %>% 
+  filter(class_recode_f %in% class_names) %>% 
+  select(isolate_id, class_recode_f, resistant_to_class) %>%
+  distinct() %>%
+  group_by(class_recode_f, resistant_to_class) %>%
+  summarise(resistant = n()) %>%
+  group_by(class_recode_f) %>%
+  mutate(tot_group = sum(resistant),
+         pct_nonsusc = round(resistant / tot_group * 100, 1)) %>% 
+  ungroup() %>%
+  filter(resistant_to_class) %>%
+  select(-resistant_to_class)
+
+confint_class_prop <- binom.confint(x = prop_class$resistant, n = prop_class$tot_group, methods = "wilson")
+prop_class$lower <- round(confint_class_prop$lower * 100, 1)
+prop_class$upper <- round(confint_class_prop$upper * 100, 1)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Get proportions for MDR
+prop_mdr <- bmt_all3 %>% 
+  select(isolate_id, mdr_new) %>% 
+  distinct() %>% 
+  group_by(mdr_new) %>% 
+  summarise(resistant = n()) %>% 
+  ungroup() %>%
+  mutate(tot_group = sum(resistant),
+         pct_nonsusc = round(resistant / tot_group * 100, 1), 
+         class_recode_f = "Multidrug-resistant") %>%
+  filter(mdr_new) %>%
+  select(-mdr_new)
+
+confint_mdr_prop <- binom.confint(x = prop_mdr$resistant, n = prop_mdr$tot_group, methods = "wilson")
+prop_mdr$lower <- round(confint_mdr_prop$lower * 100, 1)
+prop_mdr$upper <- round(confint_mdr_prop$upper * 100, 1)
+
+prop_class %>%
+  rbind(prop_mdr) %>%
+  kable("html") %>%
+  kable_styling()
+
+rm(confint_class_prop, confint_mdr_prop)
+```
+
+Proportions resistant by group with 95% confidence intervals
+
+```{r}
+class_prop_ci %>%
+  select(-resistant_to_class) %>%
+  kable("html") %>%
+  kable_styling()
+```
+
+```{r message=FALSE, warning=FALSE}
+# Figure 1 cont'd
+chart <- ggplot(data = class_prop_ci, aes(x = class_recode_f, y = pct_nonsusc, ymin = lower, ymax = upper, shape = bmt)) +
+  geom_point(position = position_dodge(width = 0.4)) + # Separate points by group
+  scale_shape_discrete(name = "",
+                        breaks=c("TRUE", "FALSE"),
+                        labels=c("HCT", "Non-HCT")) + # Modify legend
+  geom_errorbar(width = .3, position = position_dodge(width = 0.4)) +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "grey"),
+    text = element_text(size = 12), 
+    legend.position = "inside", 
+    legend.position.inside = c(.85, .94), 
+    legend.key = element_blank(),
+    plot.caption = element_text(hjust = 0)
+    ) +
+  scale_y_continuous(name = "Percent nonsusceptible", breaks = seq(0, 100, 10), limits = c(0, 100)) + 
+  scale_x_discrete(name = "", limits = rev) + # Reverse order of classes
+  coord_flip() # Switch x and y axes
+chart
+# ggsave(filename = "figure1.tiff", plot = chart, device="tiff", dpi=600, width = 7, height = 4)
+```
+
+## Table 1
+Patient characteristics by group
+
+```{r message=FALSE, warning=FALSE}
+tab1_data <- bmt_all3 %>% 
+  select(pat_id, bmt, age, gender, ethnicity_recode, culture_date, race_recode, mdr_new, sesqtile) %>%   
+  distinct() %>%
+  group_by(pat_id) %>%
+  slice(which.min(culture_date)) %>% # Select observation with minimum culture date for each patient
+  ungroup
+
+vars <- c("age", "gender", "race_recode", "ethnicity_recode",  "sesqtile")
+factorVars <- c("gender", "race_recode", "ethnicity_recode", "sesqtile")
+tableOne <- CreateTableOne(vars = vars, data = tab1_data, strata = "bmt", factorVars = factorVars)
+tbl <- (print(tableOne, nonnormal = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE, test = TRUE, testExact = fisher.test, showAllLevels = TRUE))
+
+tbl %>%
+  kable("html") %>%
+  kable_styling()
+```
+
+Locations for Table 1: using total number of isolates rather than patients
+
+```{r}
+bmt_all3 %>%
+  select(isolate_id, location_type) %>%
+  distinct() %>%
+  tabyl(location_type) %>%
+  kable("html") %>%
+  kable_styling()
+```
+
+Number of isolates per patient
+
+```{r}
+bmt_all3 %>%
+  select(pat_id, isolate_id) %>%
+  distinct() %>%
+  add_count(pat_id, name = "num_isolates") %>%
+  tabyl(num_isolates) %>%
+  kable("html") %>%
+  kable_styling()
+```
+
+```{r message=FALSE, warning=FALSE}
+table1vars_full <- bmt_all3 %>% 
+  select(pat_id, bmt, age, age50, gender, ethnicity_recode, race_recode, genus, isolate_source, culture_date, location_type, mdr_new, sesqtile) %>%   
+  distinct()
+
+table1vars_full %>% 
+  tabyl(isolate_source, bmt) %>%
+  adorn_totals(c("row", "col")) %>% 
+  adorn_percentages("col") %>% 
+  adorn_pct_formatting() %>% 
+  adorn_ns() %>%
+  adorn_title() %>%
+  kable("html") %>%
+  kable_styling()
+
+table1vars_full %>% 
+  # Recode genus not in list as 'other'
+  mutate(genus = ifelse(!(str_detect(genus,pattern = "escherichia|klebsiella|proteus|citrobacter|enterobacter")), "other", genus)) %>% 
+  tabyl(genus, bmt) %>%
+  adorn_totals(c("row", "col")) %>% 
+  adorn_percentages("col") %>% 
+  adorn_pct_formatting() %>% 
+  adorn_ns() %>%
+  adorn_title() %>%
+  kable("html") %>%
+  kable_styling()
+```
+
+## Table 2
+
+```{r message=FALSE, warning=FALSE}
+tab2_data <- bmt_all3 %>%
+  select(isolate_id, age, age50, gender, ethnicity_recode, race_recode, sesqtile, isolate_source_factor, location_type, mdr_new, bmt) %>%
+  distinct()
+
+covar_list <- c("age50", "gender", "race_recode", "isolate_source_factor", "sesqtile", "location_type") # Covariates for risk ratios
+```
+
+### Risk ratios, non-BMT
+
+```{r message=FALSE, warning=FALSE}
+# Custom function to iterate over list of variables and use sandwich variance estimator
+rrs_nonbmt <- data.frame() # Empty dataframe to store results
+
+for (i in seq_along(covar_list)) # Iterate over cols_covar vector
+{
+  formula <- as.formula(paste("mdr_new ~ ", covar_list[i])) # Use paste to create formula for model
+  glmmodel <- glm(formula, tab2_data %>% filter(!bmt), family = poisson(link = "log")) # Run model
+  est <- coeftest(glmmodel, vcov = sandwich) # Sandwich variance estimator
+  term <- names(coef(glmmodel)) # Extract term name from model results
+  estimate <- round(exp(est[,1]),2) # Extract estimate name from model results
+  lower <- round(exp(est[,1] - 1.96 * est[,2]),2) # Calculate confidence interval
+  upper <- round(exp(est[,1] + 1.96 * est[,2]),2)
+  df <- cbind(term, estimate, lower, upper) # Store results in temporary dataframe
+  rrs_nonbmt <- rbind(rrs_nonbmt, df) %>% # Bind to results dataframe and remove unneeded rows
+    filter(term != "(Intercept)",
+           estimate != 0) %>%
+    remove_rownames()
+}
+
+rrs_nonbmt %>%
+  kable("html", caption = "Risk ratios for multidrug-resistance, non-BMT patients") %>%
+  kable_styling()
+```
+
+### Risk ratios, BMT
+
+```{r message=FALSE, warning=FALSE}
+# Custom function to iterate over list of variables and use sandwich variance estimator
+rrs_bmt <- data.frame() # Empty dataframe to store results
+
+for (i in seq_along(covar_list)) # Iterate over cols_covar vector
+{
+  formula <- as.formula(paste("mdr_new ~ ", covar_list[i])) # Use paste to create formula for model
+  glmmodel <- glm(formula, tab2_data %>% filter(bmt), family = poisson(link = "log")) # Run model
+  est <- coeftest(glmmodel, vcov = sandwich) # Sandwich variance estimator
+  term <- names(coef(glmmodel)) # Extract term name from model results
+  estimate <- round(exp(est[,1]),2) # Extract estimate name from model results
+  lower <- round(exp(est[,1] - 1.96 * est[,2]),2) # Calculate confidence interval
+  upper <- round(exp(est[,1] + 1.96 * est[,2]),2)
+  df <- cbind(term, estimate, lower, upper) # Store results in temporary dataframe
+  rrs_bmt <- rbind(rrs_bmt, df) %>% # Bind to results dataframe and remove unneeded rows
+    filter(term != "(Intercept)",
+           estimate != 0) %>%
+    remove_rownames()
+}
+
+rrs_bmt %>%
+  kable("html", caption = "Risk ratios for multidrug-resistance, BMT patients") %>%
+  kable_styling()
+```
+
+## Table 3
+
+```{r message=FALSE, warning=FALSE}
+tab3_data <- bmt_all3 %>%
+  select(isolate_id, age, age50, gender, ethnicity_recode, race_recode, sesqtile, isolate_source_factor, location_type, class_recode, class_recode_f, resistant_to_class, mdr_new, bmt, culture_year) %>%
+  distinct()
+```
+
+### Risk ratios by antibiotic class
+
+```{r message=FALSE, warning=FALSE}
+# Custom function to run list of antibiotic classes and use sandwich variance estimator
+abx_class_rr_func <- function(filter_classes){
+  rr_list <- data.frame() # Empty dataframe to store results
+  
+  for (abx_class in filter_classes) {
+    filtered_data <- tab3_data[tab3_data$class_recode_f == abx_class, ]
+    glmmodel <- glm(resistant_to_class ~ bmt + rcs(age, 3) + gender + race_recode + sesqtile + isolate_source_factor + location_type + rcs(culture_year, 3), filtered_data, family = poisson(link = "log")) # Run model
+    est <- coeftest(glmmodel, vcov = sandwich) # Sandwich variance estimator
+    estimate <- round(exp(est[2,1]),2) # Extract estimate name from model results
+    stderr <- est[2,2] # Extract std error name from model results
+    lower <- round(exp(est[2,1] - 1.96 * stderr),2) # Calculate confidence interval
+    upper <- round(exp(est[2,1] + 1.96 * stderr),2)
+    df <- cbind(abx_class, estimate, lower, upper) # Store results in temporary dataframe
+    rr_list <- rbind(rr_list, df) # Add results to dataframe
+  }
+  return(rr_list)
+}
+rrs_abx_class <- abx_class_rr_func(class_names)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Run model for MDR
+glmmodel <- glm(mdr_new ~ bmt + rcs(age, 3) + gender + race_recode + sesqtile + isolate_source_factor + location_type + rcs(culture_year, 3), tab3_data %>% select(-c(class_recode, resistant_to_class)) %>% distinct(), family = poisson(link = "log"))
+est <- coeftest(glmmodel, vcov = sandwich)
+estimate <- round(exp(est[2,1]),2)
+stderr <- est[2,2]
+lower <- round(exp(est[2,1] - 1.96 * stderr),2)
+upper <- round(exp(est[2,1] + 1.96 * stderr),2)
+df <- as.data.frame(cbind(estimate, lower, upper)) %>%
+  mutate(abx_class = "Multidrug-resistant") # Create dataframe with MDR results
+
+rrs_abx_class %>%
+  rbind(df) %>% # Append MDR results
+  kable("html", caption = "Risk ratios for antibiotic class resistance, BMT vs non-BMT") %>%
+  kable_styling()
+```
+
+### Risk differences by antibiotic class
+
+```{r message=FALSE, warning=FALSE}
+# Custom function to run list of antibiotic classes and use sandwich variance estimator
+abx_class_rd_func <- function(filter_classes){
+  rd_list <- data.frame() # Empty dataframe to store results
+  
+  for (abx_class in filter_classes) {
+    filtered_data <- tab3_data[tab3_data$class_recode_f == abx_class, ]
+    glmmodel <- glm(resistant_to_class ~ bmt + rcs(age, 3) + gender + race_recode + sesqtile + isolate_source_factor + location_type + rcs(culture_year, 3), filtered_data, family = gaussian(link = "identity")) # Run model
+    est <- coeftest(glmmodel, vcov = sandwich) # Sandwich variance estimator
+    estimate <- round(est[2,1] * 100,1) # Extract estimate name from model results
+    stderr <- est[2,2] # Extract std error name from model results
+    lower <- round((est[2,1] - 1.96 * stderr) * 100,1) # Calculate confidence interval
+    upper <- round((est[2,1] + 1.96 * stderr) * 100,1)
+    df <- cbind(abx_class, estimate, lower, upper) # Store results in temporary dataframe
+    rd_list <- rbind(rd_list, df) # Add results to dataframe
+  }
+  return(rd_list)
+}
+rds_abx_class <- abx_class_rd_func(class_names)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Run model for MDR
+glmmodel <- glm(mdr_new ~ bmt + rcs(age, 3) + gender + race_recode + sesqtile + isolate_source_factor + location_type + rcs(culture_year, 3), tab3_data %>% select(-c(class_recode, resistant_to_class)) %>% distinct(), family = gaussian(link = "identity"))
+est <- coeftest(glmmodel, vcov = sandwich)
+estimate <- round((est[2,1] * 100),1)
+stderr <- est[2,2]
+lower <- round((est[2,1] - 1.96 * stderr) * 100,1)
+upper <- round((est[2,1] + 1.96 * stderr) * 100,1)
+df <- as.data.frame(cbind(estimate, lower, upper)) %>%
+  mutate(abx_class = "Multidrug-resistant")
+
+rds_abx_class %>%
+  rbind(df) %>% # Append MDR results
+  kable("html", caption = "Risk differences for antibiotic class resistance, BMT vs non-BMT") %>%
+  kable_styling()
+```
+
+### Risk ratios for mortality by antibiotic class
+
+```{r message=FALSE, warning=FALSE}
+tab4_data <- bmt_all3 %>%
+  filter(bmt) %>%
+  select(isolate_id, age, age50, gender, race_recode, ethnicity_recode, sesqtile, isolate_source_factor, location_type, class_recode_f, resistant_to_class, mdr_new, bmt, culture_year, culture_date, death_date) %>%
+  distinct() %>%
+  mutate(death_3mon = ifelse(death_date - culture_date >= 90 | is.na(death_date), FALSE, TRUE),
+         death_1yr = ifelse(death_date - culture_date >= 365 | is.na(death_date), FALSE, TRUE))
+```
+
+### 3 month mortality
+Not enough support to include location type in model
+
+```{r message=FALSE, warning=FALSE}
+# Custom function to run list of antibiotic classes and use sandwich variance estimator
+abx_class_mort_rr_func <- function(filter_classes){
+  rr_list <- data.frame() # Empty dataframe to store results
+  
+  for (abx_class in filter_classes) {
+    filtered_data <- tab4_data[tab4_data$class_recode_f == abx_class, ]
+    glmmodel <- glm(death_3mon ~ resistant_to_class + rcs(age, 3) + gender + race_recode + sesqtile + isolate_source_factor + rcs(culture_year, 3), filtered_data, family = poisson(link = "log")) # Run model
+    est <- coeftest(glmmodel, vcov = sandwich) # Sandwich variance estimator
+    estimate <- round(exp(est[2,1]),2) # Extract estimate name from model results
+    stderr <- est[2,2] # Extract std error name from model results
+    lower <- round(exp(est[2,1] - 1.96 * stderr),2) # Calculate confidence interval
+   upper <- round(exp(est[2,1] + 1.96 * stderr),2)
+    df <- cbind(abx_class, estimate, lower, upper) # Store results in temporary dataframe
+    rr_list <- rbind(rr_list, df) # Add results to dataframe
+  }
+  return(rr_list)
+}
+rrs_abx_class_mort <- abx_class_mort_rr_func(class_names)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Run model for MDR
+glmmodel <- glm(death_3mon ~ mdr_new + rcs(age, 3) + gender + race_recode + sesqtile + isolate_source_factor + rcs(culture_year, 3), tab4_data %>% select(-c(class_recode_f, resistant_to_class)) %>% distinct(), family = poisson(link = "log"))
+est <- coeftest(glmmodel, vcov = sandwich)
+estimate <- round(exp(est[2,1]),2)
+stderr <- est[2,2]
+lower <- round(exp(est[2,1] - 1.96 * stderr),2)
+upper <- round(exp(est[2,1] + 1.96 * stderr),2)
+df <- as.data.frame(cbind(estimate, lower, upper)) %>%
+  mutate(abx_class = "Multidrug-resistant")
+
+rrs_abx_class_mort %>%
+  rbind(df) %>% # Append MDR results
+  kable("html", caption = "90-day all-cause mortality") %>%
+  kable_styling()
+```
+
+### 1 year mortality
+
+```{r message=FALSE, warning=FALSE}
+# Custom function to run list of antibiotic classes and use sandwich variance estimator
+abx_class_mort_rr_func <- function(filter_classes){
+  rr_list <- data.frame() # Empty dataframe to store results
+  
+  for (abx_class in filter_classes) {
+    filtered_data <- tab4_data[tab4_data$class_recode_f == abx_class, ]
+    glmmodel <- glm(death_1yr ~ resistant_to_class + rcs(age, 3) + gender + race_recode + sesqtile + isolate_source_factor + rcs(culture_year, 3), filtered_data, family = poisson(link = "log")) # Run model
+    est <- coeftest(glmmodel, vcov = sandwich) # Sandwich variance estimator
+    estimate <- round(exp(est[2,1]),2) # Extract estimate name from model results
+    stderr <- est[2,2] # Extract std error name from model results
+    lower <- round(exp(est[2,1] - 1.96 * stderr),2) # Calculate confidence interval
+   upper <- round(exp(est[2,1] + 1.96 * stderr),2)
+    df <- cbind(abx_class, estimate, lower, upper) # Store results in temporary dataframe
+    rr_list <- rbind(rr_list, df) # Add results to dataframe
+  }
+  return(rr_list)
+}
+rrs_abx_class_mort <- abx_class_mort_rr_func(class_names)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Run model for MDR
+glmmodel <- glm(death_1yr ~ mdr_new + rcs(age, 3) + gender + race_recode + sesqtile + isolate_source_factor + rcs(culture_year, 3), tab4_data %>% select(-c(class_recode_f, resistant_to_class)) %>% distinct(), family = poisson(link = "log"))
+est <- coeftest(glmmodel, vcov = sandwich)
+estimate <- round(exp(est[2,1]),2)
+stderr <- est[2,2]
+lower <- round(exp(est[2,1] - 1.96 * stderr),2)
+upper <- round(exp(est[2,1] + 1.96 * stderr),2)
+df <- as.data.frame(cbind(estimate, lower, upper)) %>%
+  mutate(abx_class = "Multidrug-resistant")
+
+rrs_abx_class_mort %>%
+  rbind(df) %>% # Append MDR results
+  kable("html", caption = "1 year all-cause mortality") %>%
+  kable_styling()
+```
+
+## Figure 2: Rolling means for MDR
+
+```{r message=FALSE, warning=FALSE}
+# Calculate numerator for rolling mean
+tb_num <- bmt_all3 %>% 
+  select(isolate_id, culture_year, mdr_new, bmt) %>%
+  distinct() %>%
+  group_by(mdr_new, culture_year, bmt) %>%
+  summarise(n = n()) %>%
+  filter(mdr_new) %>%
+  group_by(bmt) %>%
+  arrange(culture_year, .by_group = TRUE) %>%
+  mutate(num = rollmean(n, k = 5, fill = NA)) %>%
+  ungroup() %>%
+  select(-c(n, mdr_new))
+
+# Calculate denominator for rolling mean
+tb_den <- bmt_all3 %>% 
+  select(isolate_id, culture_year, bmt) %>%
+  distinct() %>%
+  group_by(culture_year, bmt) %>%
+  summarise(n = n()) %>%
+  group_by(bmt) %>%
+  arrange(culture_year, .by_group = TRUE) %>%
+  mutate(den = rollmean(n, k = 5, fill = NA)) %>%
+  ungroup()  %>%
+  select(-n)
+
+tb_mdr <- tb_den %>%
+  left_join(tb_num) %>%
+  filter(!is.na(num)) %>%
+  mutate(mn = round(num / den * 100, 2),
+         class = "Multidrug-resistant")
+
+rm(tb_num, tb_den)
+```
+
+```{r message=FALSE, warning=FALSE}
+chart <- ggplot(tb_mdr, aes(x = culture_year, y = mn, shape = bmt, linetype = bmt)) +
+  geom_point(aes(group = bmt), size = 1.7) +
+  geom_smooth(aes(group = bmt), method = "loess", se = FALSE, colour = "black", linewidth = .5) +
+  scale_shape_discrete(name = "",
+                        breaks=c("TRUE", "FALSE"),
+                        labels=c("HCT", "Non-HCT")) +
+  scale_linetype(name = "",
+                        breaks=c("TRUE", "FALSE"),
+                        labels=c("HCT", "Non-HCT")) +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    text = element_text(size = 12), 
+    legend.position = "inside", 
+    legend.position.inside = c(.9, .9), 
+    legend.key = element_blank(),
+    axis.line = element_line(color = "grey")
+    ) +
+  ylim(0, 50) +
+  xlim(2002, 2019) +
+  xlab("Calendar year") +
+  ylab("Percent multidrug-resistant")
+
+chart
+# ggsave(filename = "figure2.tiff", plot = chart, device="tiff", dpi=500, width = 5, height = 5)
+```
+
+## Figure 3: Rolling means for all classes
+Note: Investigated why carbapenem-resistance line for BMT patients stops at 2018; no carbepenem-resistant isolates after 2021
+
+```{r message=FALSE, warning=FALSE}
+rolling_means_function <- function(filter_classes){
+  means_list <- data.frame() # Dataframe to store results
+  
+  for (abx_class in filter_classes) {
+    filtered_data <- bmt_all3[bmt_all3$class_recode_f == abx_class, ]
+    
+  numerator <- filtered_data %>% 
+    select(isolate_id, culture_year, class_recode_f, resistant_to_class, bmt) %>%
+    distinct() %>%
+    group_by(class_recode_f, resistant_to_class, culture_year, bmt) %>%
+    summarise(n = n()) %>%
+    filter(resistant_to_class) %>%
+    group_by(bmt) %>%
+    arrange(culture_year, .by_group = TRUE) %>%
+    mutate(num = rollmean(n, k = 5, fill = NA)) %>%
+    ungroup() %>%
+    select(-c(n, resistant_to_class))
+  
+  denominator <- filtered_data %>% 
+    select(isolate_id, class_recode_f, culture_year, bmt) %>%
+    distinct() %>%
+    group_by(class_recode_f, culture_year, bmt) %>%
+    summarise(n = n()) %>%
+    group_by(bmt) %>%
+    arrange(culture_year, .by_group = TRUE) %>%
+    mutate(den = rollmean(n, k = 5, fill = NA)) %>%
+    ungroup() %>%
+    select(-n)
+  
+  means <- numerator %>%
+    inner_join(denominator) %>%  
+    filter(!is.na(num)) %>%
+    mutate(mn = round(num / den * 100, 1))
+  
+  means_list <- rbind(means_list, means)
+  }
+  return(means_list)
+}
+
+means_list <- rolling_means_function(class_names)
+```
+
+```{r message=FALSE, warning=FALSE}
+chart <- ggplot(means_list %>% 
+                  filter(class_recode_f != "Cephalosporins, 2nd generation"), 
+                aes(x = culture_year, y = mn, shape = bmt)) +
+  geom_point(aes(group = bmt), size = 1.4) +
+  geom_smooth(aes(group = bmt, linetype = bmt), span = .8, se = FALSE, method = "loess", color = "black", linewidth = .5) +
+  scale_shape_discrete(name = "",
+                        breaks=c("TRUE", "FALSE"),
+                        labels=c("HCT", "Non-HCT")) +
+  scale_linetype(name = "",
+                        breaks=c("TRUE", "FALSE"),
+                        labels=c("HCT", "Non-HCT")) +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    text = element_text(size = 12), 
+    legend.key = element_blank(),
+    axis.line = element_line(color = "grey")
+    ) +
+  scale_x_continuous(name = "Calendar year", limits = c(2005, 2022)) +
+  scale_y_continuous(name = "Percent non-susceptible", limits = c(0, 75)) +
+  facet_wrap(~ class_recode_f, 
+             labeller = label_wrap_gen(width = 20))
+chart
+# ggsave(filename = "figure3.tiff", plot = chart, device="tiff", dpi=600, width = 10, height = 7)
+```
+
+Survival analysis
+
+```{r message=FALSE, warning=FALSE}
+df_surv <- bmt_all3 %>%
+  filter(bmt) %>%
+  select(pat_id, culture_date, death_date, class_recode, resistant_to_class, mdr_new) %>%
+  distinct() %>%
+  group_by(pat_id) %>%
+  slice(which.min(culture_date)) %>%
+  ungroup() %>%
+  mutate(class_recode = factor(class_recode, levels = c("aminoglycoside", "antipseudomonal_cephalosporin", "cephalosporin_3rd_gen", "penicillins", "penicillins_bli", "quinolone"), labels = c("Aminoglycosides", "Cephalosporins, Anti-Pseudomonal", "Cephalosporins, 3rd generation",  "Penicillins", "Penicillin/Beta-lactamase inhibitors", "Quinolones")))
+
+df_surv1 <- df_surv %>%
+  rename(t0 = culture_date) %>%
+  mutate(status = ifelse(!is.na(death_date), 2, 1),
+         status_f = factor(status, labels = c("Survived", "Died")),
+         tf = as.Date(ifelse(status == 2, death_date, as.Date("2020-12-31"))),
+         time = as.numeric(tf - t0),
+         time = ifelse(time < 0, 0, time))
+```
+
+```{r message=FALSE, warning=FALSE}
+class_names_surv <- c("Aminoglycosides", "Cephalosporins, 3rd generation", "Cephalosporins, Anti-Pseudomonal", "Penicillins", "Penicillin/Beta-lactamase inhibitors", "Quinolones")
+
+freqs <- map_df(class_names_surv, ~ df_surv1 %>%
+      filter(class_recode == .x) %>%
+        tabyl(status_f, resistant_to_class) %>%
+        adorn_totals("col") %>%
+        rename(resistant = 'TRUE',
+               susceptible = 'FALSE') %>%
+        mutate(class = .x,
+               pct_resistant = round(resistant / Total * 100,1))) %>%
+  select(class, status_f, susceptible, resistant, pct_resistant)
+
+freqs  %>%
+  kable("html", caption = "Resistance and survival frequencies") %>%
+  kable_styling()
+```
+
+Kaplan-Meier curves by antibiotic class and MDR
+
+```{r message=FALSE, warning=FALSE}
+survfit_plots <- function(filter_values) {
+  survplot_list <- list()
+  
+  for (value in filter_values) {
+    filtered_data <- df_surv1[df_surv1$class_recode == value, ]
+    fit_surv <- survfit(Surv(time, status) ~ resistant_to_class, data = filtered_data)
+    
+    survplot <- ggsurvplot(
+      fit_surv,
+      data = filtered_data,
+      title = value,
+      censor = FALSE,
+      risk.table = TRUE,
+      pval = TRUE,
+      ggtheme = theme_classic(),
+      palette = c("#E7B800", "#2E9FDF"),
+      xlim = c(1, 365),
+      break.x.by = 100,
+      legend = "none",
+      tables.col = "strata",
+      fontsize = 3,
+      legend.labs = c("Susceptible", "Nonsuceptible")
+    )
+    survplot_list[[as.character(value)]] <- survplot
+  }
+  return(survplot_list)
+}
+result_plots <- survfit_plots(class_names_surv)
+```
+
+```{r message=FALSE, warning=FALSE}
+fit_surv <- survfit(Surv(time, status) ~ mdr_new, data = df_surv1 %>% select(-c(class_recode, resistant_to_class)) %>% distinct())
+    
+survplot_mdr <- ggsurvplot(
+  fit_surv,
+  data = df_surv1 %>% select(-c(class_recode, resistant_to_class)) %>% distinct(),
+  #title = "Multidrug-resistant",
+  censor = FALSE,
+  risk.table = TRUE,
+  pval = TRUE,
+  ggtheme = theme_classic(),
+  palette = "grey",
+  xlim = c(1, 365),
+  break.x.by = 100,
+  legend = "top",
+  legend.title="",
+  fontsize = 3,
+  legend.labs = c("Susceptible", "Nonsuceptible"),
+  risk.table.y.text.col = FALSE
+  )
+
+result_plots[["Multidrug-resistant"]] <- survplot_mdr
+result_plots
+
+# grid.draw.ggsurvplot <- function(x){
+#   survminer:::print.ggsurvplot(x, newpage = FALSE)
+# }
+
+# ggsave("km_curve_mdr.tiff", plot = survplot_mdr, dpi=300, width = 5, height = 5, units = "in")
+```
+
+
+
+
+
+
+
+
+
+
+
