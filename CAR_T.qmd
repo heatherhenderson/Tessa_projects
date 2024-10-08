@@ -1,0 +1,506 @@
+---
+title: "CAR_T"
+author: "Henderson, Heather"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+format: html
+self-contained: true
+toc: true
+toc-depth: 2
+editor: visual
+---
+
+```{r}
+#| label: load-packages
+#| echo: false
+#| output: false
+packages <- function(x) {
+  for (i in x) {
+    if (!require(i, character.only = TRUE)) {
+      install.packages(i, dependencies = TRUE)
+      library(i, character.only = TRUE)
+    }
+  }
+}
+packages(c("readxl", "readr", "tidyverse" , "data.table" , "naniar", "rockchalk", "lubridate", "kableExtra", "DT", "formatR", "zoo", "janitor", "sjlabelled", "sandwich", "lmtest", "tableone", "broom", "survminer", "survival", "cmprsk", "condSURV", "tidycmprsk", "gtsummary", "ggsurvfit"))
+```
+
+# Raw data
+
+```{r}
+#| label: raw-data
+#| output: false
+setwd("C:/Users/henderh/OneDrive - University of North Carolina at Chapel Hill/Projects/Andermann/CAR_T")
+
+patient_data <- read_excel("CD30Nonrepeated_10_16.xlsx")
+infection_data <- read_excel("CD30Infections.xlsx")
+censoring_data <- read_excel("CD30CompetingEvents.xlsx")
+# df_all <- read_rds("df_all_excl_relapse.rds")
+```
+
+# Data cleaning
+
+```{r}
+#| label: cleaning-infections-data
+
+infections <- infection_data |>
+  mutate_all(tolower) |>
+  clean_names() |>
+  select(-c(2:42)) |>
+  rename(confirmed = include_as_microbiologically_confirmed_infection_45,
+         bacteria = bacterial_organism_55,
+         fungus = fungal_organism_69,
+         virus = causative_virus_73) |>
+  filter(confirmed == "yes") |> # Select only confirmed infections
+  mutate(infection_date = as.Date(infection_date)) |>
+  select(record_id, infection_date, confirmed, pathogen_type, bacteria, fungus, virus)
+
+n_distinct(infections$record_id)
+glimpse(infections)
+# IDs 41 and 78 had 2 types of infection
+```
+
+23 patients with infections
+
+```{r}
+#| label: cleaning-cohort-data
+patients <- patient_data |>
+  select(1,6,10:12,38,39,41,51,128:130,134,135,137,138,141,142,161,165,173,174,211,212) |>
+  clean_names() |>
+  mutate_all(tolower) |>
+  distinct() |>
+  rename(age = age_at_car_t_infusion,
+         trial_num = car_t_trial_number_e_g_lccc_1524_or_na_if_not_in_trial,
+         kps = kps_at_date_of_car_t_infusion,
+         ecog = ecog_ps_at_date_of_car_t_infusion,
+         malignancy_type = malignancy_type_for_which_car_t_is_indicated,
+         prep_regimen = car_t_preparatory_regimen,
+         prep_regiman_other = car_t_preparatory_regimen_other,
+         infusion_date = car_t_infusion_date,
+         anc_at_lymphodepletion = anc_at_lymphodepletion_on_1st_day_of_lymphodepletion,
+         alc_at_lymphodepletion = alc_at_lymphodepletion_on_1st_day_of_lymphodepletion,
+         recent_anc = most_recent_anc_to_day_30anc_at_date_closest_to_30d_prior_to_car_t_infusion,
+         recent_alc = most_recent_alc_to_day_30_alc_at_date_closest_to_30d_prior_to_car_t_infusion,
+         febrile_neutropenia = febrile_neutropenia_post_car_t_infusion,
+         relapse_date = date_of_relapse,
+         death_date = date_of_death_if_applicable,
+         disease_state_pre = disease_state_pre_treatment,
+         last_follow_up = last_follow_up_date_when_chart_last_checked_for_outcomes,
+         therapy_lines_num_dif = number_of_different_lines_of_therapy_prior_to_car_t,
+         therapy_lines_num_tot = number_of_total_lines_of_therapy_pre_car_t) |>
+  mutate(age = as.numeric(age),
+         race = case_when(race == "caucasian" ~ "white",
+                           race ==  "african descent" ~ "black",
+                           TRUE ~ "other/unknown"),
+         race = factor(race, levels = c("white", "black", "other/unknown")),
+         recent_anc = as.numeric(recent_anc),
+         recent_alc = as.numeric(recent_alc),
+         kps = as.numeric(kps),
+         ecog = as.numeric(ecog),
+         anc_at_lymphodepletion = as.numeric(anc_at_lymphodepletion),
+         alc_at_lymphodepletion = as.numeric(alc_at_lymphodepletion),
+         infusion_date = as.Date(infusion_date),
+         relapse_date = as.Date(relapse_date),
+         death_date = as.Date(death_date),
+         last_follow_up = as.Date(last_follow_up),
+         disease_state_pre = factor(disease_state_pre,
+                                         levels = c("cr", "pr", "sd", "pd"),
+                                         labels = c("complete remission", "partial remission", "stable disease", "progressive disease")),
+         therapy_lines_num_dif = as.numeric(therapy_lines_num_dif),
+         therapy_lines_num_tot = as.numeric(therapy_lines_num_tot)) |>
+  filter(!is.na(record_id))
+
+glimpse(patients)
+```
+
+```{r}
+#| label: cleaning-censoring-data
+
+censoring <- censoring_data |>
+  clean_names() |>
+  mutate_all(tolower) |>
+  mutate(censor_date = as.Date(date_of_competing_event)) |>
+  rename(event_type = if_there_was_a_competing_or_censoring_event_within_that_year_what_was_it ) |>
+  select(record_id, censor_date, event_type)
+
+glimpse(censoring)
+```
+
+64 patients
+
+```{r}
+#| label: merge-data
+
+df <- patients |>
+  left_join(censoring) |>
+  left_join(infections) |>
+  mutate(infection = ifelse(!is.na(pathogen_type), "infection", "no infection"),
+         malignancy_type = ifelse(malignancy_type %in% c("dlbcl", "non- dlbcl non-hodgkin lymphoma (nhl)", "other"), "nhl", "hl")) # Group non-Hodgkins
+```
+
+# Descriptive statistics
+
+### Stratified by malignancy type
+
+```{r}
+#| label: table-1a
+
+df1 <- df |>
+  select(record_id, age, sex, race, disease_state_pre, crs, crs_grade_max, malignancy_type, recent_anc, recent_alc, prep_regimen, therapy_lines_num_dif, therapy_lines_num_tot) |>
+  distinct()
+
+vars <- c("age", "sex", "race", "disease_state_pre", "crs", "crs_grade_max", "recent_anc", "recent_alc", "prep_regimen", "therapy_lines_num_dif", "therapy_lines_num_tot")
+factorVars <- c("sex", "race", "disease_state_pre", "crs", "crs_grade_max", "prep_regimen")
+tableOne <- CreateTableOne(vars = vars, data = df1, factorVars = factorVars, strata = "malignancy_type")
+tbl <- (print(tableOne, nonnormal = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE, test = TRUE, testExact = fisher.test, showAllLevels = TRUE))
+tbl |> 
+  kable("html") |>
+  kable_styling()
+```
+
+### Stratified by post-CAR-T infection
+
+```{r}
+#| label: table-1b
+df2 <- df |>
+  select(record_id, age, sex, race, disease_state_pre, crs, crs_grade_max, malignancy_type, recent_anc, recent_alc, prep_regimen, infection) |>
+  distinct()
+
+vars <- c("age", "sex", "race", "disease_state_pre", "crs", "crs_grade_max", "recent_anc", "recent_alc", "prep_regimen", "malignancy_type")
+factorVars <- c("sex", "race", "disease_state_pre", "crs", "crs_grade_max", "prep_regimen", "malignancy_type")
+tableOne <- CreateTableOne(vars = vars, data = df2, factorVars = factorVars, strata = "infection")
+tbl <- (print(tableOne, nonnormal = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE, test = TRUE, testExact = fisher.test, showAllLevels = TRUE))
+tbl |> 
+  kable("html") |>
+  kable_styling()
+```
+
+# Dataset for modelling
+Excluding patients with relapse
+All pathogen types
+
+```{r}
+#| label: time-to-event-relapse
+
+df_all <- df |>
+  # Start follow-up
+  rename(t0 = infusion_date) |> 
+  mutate(oneyr = t0 + 365,
+         # End follow-up accounting for relapse
+         tf = pmin(oneyr, infection_date, relapse_date, censor_date, na.rm = TRUE), 
+         ftime = as.numeric(tf - t0), # Get follow-up time
+         # Set death to FALSE if after end of follow-up
+         death = ifelse(is.na(death_date) | death_date > tf, FALSE, TRUE), 
+         # Reclassify infection as FALSE if after censor date
+         infection = ifelse(infection_date <= tf, TRUE, FALSE), 
+         # Set pathogen type to 'none' if infection date after end of follow-up
+         pathogen_type = ifelse(infection_date > tf | is.na(infection_date), "none", pathogen_type),
+         # Assign status
+         fstatus = factor(case_when(infection ~ 1,
+                                    TRUE ~ 0), labels = c("Censored", "Infection")),
+         a = TRUE) |>
+  # Create indicator variables for pathogen type
+  pivot_wider(names_from = pathogen_type, values_from = a, names_prefix = "path_type_", values_fill = FALSE) |>
+  mutate(path_type_any = !path_type_none) |>
+  select(-c(path_type_none, infection))
+# write_rds(df_all, "df_all_excl_relapse.rds")
+```
+
+```{r}
+#| label: plot-cum-inc-relapse
+
+fit_all <- cuminc(Surv(ftime, fstatus) ~ 1, data = df_all |> slice_min(tf, by = record_id))
+ci_all <- fit_all |>
+  ggcuminc(outcome = "Infection") +
+  add_confidence_interval() +
+  add_risktable() +
+  scale_x_continuous("Days to infection", breaks = seq(0, 365, 30), limits = c(0, 365)) +
+  scale_y_continuous("Cumulative incidence", limits = c(0, .5, .1)) +
+  theme_classic() +
+  theme(legend.position = "none")
+ci_all
+
+fit_all |>
+  tbl_cuminc(times = c(90, 180, 270, 365), label_header = "**Day {time}**") |>
+  add_n()
+# ggsave(filename = "ci_all_excl_relapse.tiff", plot = ci_all, device="tiff", dpi=600, width = 7, height = 5)
+```
+
+### Viral infections
+
+```{r}
+#| label: time-to-event-viral-relapse
+
+df_viral <- df_all |>
+  select(record_id, oneyr, infection_date, relapse_date, censor_date, death_date, t0, path_type_viral) |>
+  distinct() |>
+  mutate(infection_date = as.Date(ifelse(!path_type_viral, NA_Date_, infection_date)),
+         # End follow-up accounting for relapse
+         tf = pmin(oneyr, infection_date, relapse_date, censor_date, na.rm = TRUE), 
+         # Get follow-up time
+         ftime = as.numeric(tf - t0), 
+         # Set death to FALSE if after end of follow-up
+         death = ifelse(is.na(death_date) | death_date > tf, FALSE, TRUE), 
+         # Reclassify infection as FALSE if after censor date
+         fstatus = factor(case_when(path_type_viral ~ 1,
+                                    TRUE ~ 0), labels = c("Censored", "Infection"))) |>
+  slice_min(tf, by = record_id)
+```
+
+```{r}
+#| label: plot-cum-inc-viral-relapse
+
+fit_viral <- cuminc(Surv(ftime, fstatus) ~ 1, data = df_viral)
+ci_viral <- fit_viral |>
+  ggcuminc(outcome = "Infection") +
+  add_confidence_interval() +
+  add_risktable() +
+  scale_x_continuous("Days to infection", breaks = seq(0, 365, 30), limits = c(0, 365)) +
+  scale_y_continuous("Cumulative incidence", limits = c(0, .5, .1)) +
+  theme_classic() +
+  theme(legend.position = "none")
+ci_viral
+
+fit_viral |>
+  tbl_cuminc(times = c(90, 180, 270, 365), label_header = "**Day {time}**") |>
+  add_n()
+# ggsave(filename = "ci_viral.tiff", plot = ci_viral, device="tiff", dpi=600, width = 7, height = 5)
+```
+
+### Bacterial infections
+
+```{r}
+#| label: time-to-event-bacterial-relapse
+
+df_bact <- df_all |>
+  select(record_id, oneyr, infection_date, relapse_date, censor_date, death_date, t0, path_type_bacterial) |>
+  distinct() |>
+  mutate(infection_date = as.Date(ifelse(!path_type_bacterial, NA_Date_, infection_date)),
+         # End follow-up accounting for relapse
+         tf = pmin(oneyr, infection_date, relapse_date, censor_date, na.rm = TRUE), 
+         # Get follow-up time
+         ftime = as.numeric(tf - t0), 
+         # Set death to FALSE if after end of follow-up
+         death = ifelse(is.na(death_date) | death_date > tf, FALSE, TRUE), 
+         # Reclassify infection as FALSE if after censor date
+         fstatus = factor(case_when(path_type_bacterial ~ 1,
+                                    TRUE ~ 0), labels = c("Censored", "Infection"))) |>
+  distinct() |>
+  slice_min(tf, by = record_id)
+```
+
+```{r}
+#| label: plot-cum-inc-bacterial-relapse
+
+fit_bact <- cuminc(Surv(ftime, fstatus) ~ 1, data = df_bact)
+ci_bact <- fit_bact |>
+  ggcuminc(outcome = "Infection") +
+  add_confidence_interval() +
+  add_risktable() +
+  scale_x_continuous("Days to infection", breaks = seq(0, 365, 30), limits = c(0, 365)) +
+  scale_y_continuous("Cumulative incidence", limits = c(0, .5, .1)) +
+  theme_classic() +
+  theme(legend.position = "none")
+ci_bact
+
+fit_bact |>
+  tbl_cuminc(times = c(90, 180, 270, 365), label_header = "**Day {time}**") |>
+  add_n()
+# ggsave(filename = "ci_bact.tiff", plot = ci_bact, device="tiff", dpi=600, width = 7, height = 5)
+```
+
+Association of ANC with infection
+
+```{r}
+#| label: anc-df
+
+df_all1 <- df_all |>
+  mutate(anc_low = ifelse(recent_anc <= 1.8, TRUE, FALSE),
+         infection = ifelse(!is.na(infection_date), TRUE, FALSE),
+         trial_lcc1524 = ifelse(str_detect(trial_num, "1524"), TRUE, FALSE))
+# Trial LCC 1524 was not significant when added to models 
+```
+
+```{r}
+#| label: anc-infection-freqs
+
+df_all1 |>
+  tabyl(anc_low, infection) |>
+  adorn_percentages("col") |>
+  adorn_pct_formatting() |>
+  adorn_ns() |>
+  adorn_title() |>
+  kable("html") |>
+  kable_styling()
+```
+
+## Risk ratios - GLM models
+RR ~ 2.0 regardless of covariate adjustment
+
+```{r}
+#| label: anc-infection-glm-model
+# Fit unadjusted GLM model
+fit_anc_glm <- glm(infection ~ anc_low, family = poisson(link = "log"), data = df_all1) 
+results <- coeftest(fit_anc_glm, vcov = sandwich)
+model_results <- round(cbind(RR = exp(results[,1]),
+                       LCI = exp(results[,1] - 1.96 * results[,2]),
+                       UCI = exp(results[,1] + 1.96 * results[,2]),
+                       P_value = results[,4]),2)
+model_results[-1,] |>
+  kable(caption = "Unadjusted model") |>
+  kable_styling()
+# Adjusting only for age
+fit_anc_glm <- glm(infection ~ anc_low + poly(age,2), family = poisson(link = "log"), data = df_all1) 
+results <- coeftest(fit_anc_glm, vcov = sandwich)
+model_results <- round(cbind(RR = exp(results[,1]),
+                       LCI = exp(results[,1] - 1.96 * results[,2]),
+                       UCI = exp(results[,1] + 1.96 * results[,2]),
+                       P_value = results[,4]),2)
+model_results[-1,] |>
+  kable(caption = "Model adjusted for age") |>
+  kable_styling()
+# Adjusting only for sex
+fit_anc_glm <- glm(infection ~ anc_low + sex, family = poisson(link = "log"), data = df_all1) 
+results <- coeftest(fit_anc_glm, vcov = sandwich)
+model_results <- round(cbind(RR = exp(results[,1]),
+                       LCI = exp(results[,1] - 1.96 * results[,2]),
+                       UCI = exp(results[,1] + 1.96 * results[,2]),
+                       P_value = results[,4]),2)
+model_results[-1,] |>
+  kable(caption = "Model adjusted for sex") |>
+  kable_styling()
+# Adjusting only for race
+fit_anc_glm <- glm(infection ~ anc_low + race, family = poisson(link = "log"), data = df_all1) 
+results <- coeftest(fit_anc_glm, vcov = sandwich)
+model_results <- round(cbind(RR = exp(results[,1]),
+                       LCI = exp(results[,1] - 1.96 * results[,2]),
+                       UCI = exp(results[,1] + 1.96 * results[,2]),
+                       P_value = results[,4]),2)
+model_results[-1,] |>
+  kable(caption = "Model adjusted for race - best fitting model") |>
+  kable_styling()
+# Adjusting for age, race, and sex
+fit_anc_glm <- glm(infection ~ anc_low + poly(age,2) + race + sex, family = poisson(link = "log"), data = df_all1) 
+results <- coeftest(fit_anc_glm, vcov = sandwich)
+model_results <- round(cbind(RR = exp(results[,1]),
+                       LCI = exp(results[,1] - 1.96 * results[,2]),
+                       UCI = exp(results[,1] + 1.96 * results[,2]),
+                       P_value = results[,4]),2)
+model_results[-1,] |>
+  kable(caption = "Fully adjusted model") |>
+  kable_styling()
+
+rm(list=ls(pattern = c("^fit_|^model_")))
+```
+
+## Hazard ratios - Fine-Gray models
+ANC analysis
+
+```{r}
+#| label: time-to-event-df
+
+df_all2 <- df_all1 |>
+  mutate(fstatus_cr = case_when(death_date == tf ~ "Death",
+                                TRUE ~ fstatus),
+         fstatus_cr = factor(fstatus_cr, levels = c("Censored", "Infection", "Death")),
+         fstatus = as.numeric(fstatus),
+         ther_lines_cat = ifelse(therapy_lines_num_tot <= 4, "<=4", ">=5"))
+```
+
+```{r}
+#| label: anc-infection-fg-model
+ # Fit unadjusted Fine-Gray model
+fit_anc_fg <- crr(Surv(ftime, fstatus_cr) ~ anc_low, data = df_all2)
+fit_anc_fg |> tbl_regression(exponentiate = TRUE)
+# Adjusting only for age
+fit_anc_fg <- crr(Surv(ftime, fstatus_cr) ~ anc_low + poly(age,2), data = df_all2) 
+fit_anc_fg |> tbl_regression(exponentiate = TRUE)
+# Adjusting only for sex
+fit_anc_fg <- crr(Surv(ftime, fstatus_cr) ~ anc_low + sex, data = df_all2) 
+fit_anc_fg |> tbl_regression(exponentiate = TRUE)
+# Adjusting only for race
+fit_anc_fg <- crr(Surv(ftime, fstatus_cr) ~ anc_low + race, data = df_all2) 
+fit_anc_fg |> tbl_regression(exponentiate = TRUE)
+# Adjusting for age, race, and sex
+fit_anc_fg <- crr(Surv(ftime, fstatus_cr) ~ anc_low + poly(age,2) + race + sex, data = df_all2) 
+fit_anc_fg |> tbl_regression(exponentiate = TRUE)
+```
+
+### Lines of therapy analysis
+Median 4 total lines of therapy
+Interaction with trial LCC 1524
+
+```{r}
+#| label: ther-lines-fg-model
+# Fit unadjusted Fine-Gray model
+fit_lines_fg <- crr(Surv(ftime, fstatus_cr) ~ ther_lines_cat, data = df_all2) 
+fit_lines_fg |> tbl_regression(exponentiate = TRUE)
+
+fit_lines_fg <- crr(Surv(ftime, fstatus_cr) ~ ther_lines_cat + poly(age,2), data = df_all2) 
+fit_lines_fg |> tbl_regression(exponentiate = TRUE)
+```
+
+### Cox model for infections in HL vs. non-HL
+Deaths censored
+
+```{r}
+#| label: HR-malig-type-Cox
+
+fit_malig_type_cox <- coxph(Surv(ftime, fstatus) ~ malignancy_type, data = df_all2)
+fit_malig_type_cox |> tbl_regression(exponentiate = TRUE)
+```
+
+### Fine-Gray model for infections in HL vs. non-HL
+Death as a competing risk
+
+```{r}
+#| label: HR-malig-type-FG
+
+fit_malig_type_fg <- crr(Surv(ftime, fstatus_cr) ~ malignancy_type, data = df_all2)
+fit_malig_type_fg |> tbl_regression(exponentiate = TRUE)
+
+rm(list=ls(pattern = c("^fit_")))
+```
+
+Infection densities
+
+```{r}
+# Define time intervals
+intervals <- data.frame(
+  start_day = c(1, 31, 91),
+  end_day = c(30, 90, 365),
+  interval = 1:3
+)
+
+df1 <- df |>
+  # Define follow-up start and end dates, calculate total follow-up time per patient
+  mutate(t0 = infusion_date,
+         tf = pmin(relapse_date, death_date, censor_date, t0 + 365, na.rm = TRUE),
+         ftime_all = as.numeric(tf - t0)) |> 
+  select(record_id, t0, infection_date, tf) |>
+  mutate(interval = list(intervals)) |>
+  # Expand to include all intervals for each patient and infection date
+  unnest(cols = c(interval)) |>
+  # Calculate follow-up days in each interval
+  mutate(int_start = t0 + start_day,
+    int_end = pmin(tf, t0 + end_day),
+    int_days = as.numeric(int_end - int_start + 1),
+    int_days = ifelse(int_days < 0, 0, int_days)) |>
+  # Add indicator for infection within interval and deduplicate
+  mutate(infection_int = infection_date >= int_start & infection_date <= int_end,
+         infection_int = ifelse(is.na(infection_int), FALSE, infection_int)) |>
+  group_by(record_id, interval) |>
+  mutate(num_infections = sum(infection_int)) |>
+  ungroup() |>
+  select(-c(infection_date, infection_int)) |>
+  distinct()
+  
+df1 |>
+  group_by(interval) |>
+  summarise(inf_dens = sum(num_infections) / sum(int_days) * 100) |>
+  ungroup()
+```
+
+
+
+
+
